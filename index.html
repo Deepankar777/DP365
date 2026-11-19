@@ -277,7 +277,7 @@ details[open] summary::after{content:"–"}
 .ban small{font-size:12.5px;font-weight:600;color:var(--mute)}
 .ban .grow{flex:1;min-width:0}
 .ban .big{height:42px;font-size:17px;padding:0 14px}
-.toast{position:fixed;z-index:60;left:50%;bottom:calc(84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-weight:600;font-size:13.5px;animation:fade .2s;white-space:nowrap;max-width:calc(100% - 32px);overflow:hidden;text-overflow:ellipsis}
+.toast{position:fixed;z-index:70;left:50%;bottom:calc(84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-weight:600;font-size:13.5px;animation:fade .2s;white-space:nowrap;max-width:calc(100% - 32px);overflow:hidden;text-overflow:ellipsis}
 @keyframes fade{from{opacity:0}}
 @keyframes up{from{transform:translateY(40px);opacity:0}}
 @keyframes down{from{transform:translateY(-30px);opacity:0}}
@@ -343,7 +343,7 @@ const getDoc=id=>id==='config'?S.cfg:id==='weights'?S.weights:S.months[id.slice(
 function setDoc(id,b){if(id==='config')S.cfg=normCfg(b);else if(id==='weights')S.weights={w:b.w||{},t:b.t||0};else if(id.indexOf('m-')===0)S.months[id.slice(2)]={days:b.days||{},t:b.t||0}}
 const allIds=()=>['config','weights'].concat(Object.keys(S.months).map(k=>'m-'+k));
 function saveLocal(){try{localStorage.setItem(LSK,JSON.stringify(S))}catch(e){}}
-function touch(id){const d=getDoc(id);if(d)d.t=Date.now();dirty.add(id);saveLocal();clearTimeout(flushT);flushT=setTimeout(flush,900)}
+function touch(id){const d=getDoc(id);if(d)d.t=Date.now();dirty.add(id);saveLocal();clearTimeout(flushT);flushT=setTimeout(flush,900);ghSchedule()}
 function flush(){if(!col)return;dirty.forEach(id=>{if(inflight.has(id))return;const d=getDoc(id);if(!d){dirty.delete(id);return}
   dirty.delete(id);inflight.add(id);
   col.doc(id).set(clone(d)).then(()=>{inflight.delete(id);sync='synced';if(dirty.has(id))flush()},()=>{inflight.delete(id);dirty.add(id);sync='error';clearTimeout(flushT);flushT=setTimeout(flush,20000)})})}
@@ -358,6 +358,39 @@ async function initSync(){try{if(!(window.claude&&window.claude.use))return;
   if(await pull())render()}catch(e){sync=col?'error':'local'}}
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState!=='visible')return;tick();
   if(col&&!dirty.size&&!inflight.size&&Date.now()-lastPull>60000&&!ui.sheet)pull().then(c=>{if(c)render()},()=>{})});
+
+/* ---------- optional backup + sync to a private GitHub repo (one JSON file, merged per document by timestamp) ---------- */
+const GHK='yearone.gh',GHF='dp365.json';let gh=null,ghSha=null,ghState='off',ghMsg='',ghT=0,ghBusy=false,ghAgain=false,ghLast=0,ghPending=false;
+try{gh=JSON.parse(localStorage.getItem(GHK)||'null')}catch(e){}
+function ghReq(path,opt){opt=opt||{};return fetch('https://api.github.com/repos/'+gh.repo+path,{method:opt.method||'GET',cache:'no-store',headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+gh.token,'X-GitHub-Api-Version':'2022-11-28'},body:opt.body})}
+const b64e=x=>btoa(unescape(encodeURIComponent(x))),b64d=x=>decodeURIComponent(escape(atob(x.replace(/\s/g,''))));
+async function ghPull(){const r=await ghReq('/contents/'+GHF);
+  if(r.status===404){ghSha=null;return{changed:false,ahead:true}}
+  if(!r.ok)throw{status:r.status};
+  const j=await r.json();ghSha=j.sha;if(!j.content)throw{status:0};
+  const remote=JSON.parse(b64d(j.content)),Rm={config:remote.cfg,weights:remote.weights};Object.keys(remote.months||{}).forEach(k=>{Rm['m-'+k]=remote.months[k]});
+  let changed=false,ahead=false;
+  Object.keys(Rm).forEach(id=>{const b=Rm[id];if(!b)return;const loc=getDoc(id);if(!loc||(b.t||0)>(loc.t||0)){setDoc(id,b);changed=true}else if((loc.t||0)>(b.t||0))ahead=true});
+  allIds().forEach(id=>{const d=getDoc(id);if(!Rm[id]&&d&&d.t)ahead=true});
+  if(changed)saveLocal();return{changed:changed,ahead:ahead}}
+function ghFail(e){ghState='error';const st=e&&e.status;ghMsg=st===401?'GitHub no longer accepts the token. Disconnect and connect again with a new one.':(st===403||st===404)?'The token can’t write to that repo.':'Couldn’t reach GitHub. It will retry on your next change.'}
+async function ghPush(force){if(!gh)return;if(ghBusy){ghAgain=true;return}ghBusy=true;ghPending=false;ghState='busy';
+  try{for(let i=0;i<2;i++){
+      if(force&&i===0){const r0=await ghReq('/contents/'+GHF);ghSha=r0.ok?(await r0.json()).sha:null}
+      const body={message:'DP365 log '+TODAY(),content:b64e(JSON.stringify(S))};if(ghSha)body.sha=ghSha;
+      const r=await ghReq('/contents/'+GHF,{method:'PUT',body:JSON.stringify(body)});
+      if(r.ok){ghSha=(await r.json()).content.sha;ghState='ok';ghLast=Date.now();ghMsg='';break}
+      if((r.status===409||r.status===422)&&i===0){const m=await ghPull();if(m.changed&&!ui.sheet)render();continue}
+      throw{status:r.status}}}
+  catch(e){ghFail(e)}
+  ghBusy=false;if(ghAgain){ghAgain=false;ghSchedule(500)}}
+function ghSchedule(ms){if(!gh)return;ghPending=true;clearTimeout(ghT);ghT=setTimeout(()=>ghPush(),ms||2500)}
+async function ghSync(){if(!gh||ghBusy)return;ghState='busy';try{const m=await ghPull();if(m.changed&&!ui.sheet)render();if(m.ahead)await ghPush();else{ghState='ok';ghLast=Date.now();ghMsg=''}}catch(e){ghFail(e)}}
+document.addEventListener('visibilitychange',()=>{if(!gh)return;if(document.visibilityState==='visible'){if(Date.now()-ghLast>30000)ghSync()}else if(ghPending){clearTimeout(ghT);ghPush()}});
+function ghBlock(){if(col)return'<p>Saved privately to your Claude account. Open Year One on any device and it’s all there.</p>';
+  if(gh){const d=new Date(ghLast);return'<div><h4>Backup and sync</h4><p>'+(ghState==='error'?esc(ghMsg):ghState==='busy'?'Syncing with '+esc(gh.repo)+'…':'Backed up to '+esc(gh.repo)+(ghLast?' at '+pad(d.getHours())+':'+pad(d.getMinutes()):'')+'. Every change saves there automatically.')+'</p><div class="rowbtns" style="margin-top:10px"><button class="big soft" data-a="ghOff">Disconnect</button><button class="big ink" data-a="ghNow">Sync now</button></div></div>'}
+  const u=/\.github\.io$/.test(location.hostname)?location.hostname.split('.')[0]+'/dp365-data':'';
+  return'<div><h4>Backup and sync</h4><p style="margin-bottom:10px">Saved on this device only. Connect a private GitHub repo to back it up and sync it across your devices.</p><div style="display:flex;flex-direction:column;gap:8px"><input class="field" id="gh-repo" placeholder="username/dp365-data" value="'+esc(u)+'" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="GitHub repo, as username/repo"><input class="field" id="gh-token" type="password" placeholder="Paste access token" autocomplete="off" aria-label="GitHub access token"><button class="big ink" data-a="ghOn">Connect</button></div></div>'}
 
 /* ---------- model ---------- */
 const getDay=d=>{const m=S.months[d.slice(0,7)];return(m&&m.days[d])||{}};
@@ -576,7 +609,7 @@ function shSettings(){const c=S.cfg,p=c.plan;
    '<div><h4>The day</h4><div class="line"><span>Tomorrow’s brief from</span><input class="field" type="time" id="set-night" data-cfg="night" value="'+pad(c.night)+':00" step="3600"></div>'+
    '<div class="line"><span>Day one</span><input class="field" type="date" id="set-start" data-cfg="start" value="'+c.start+'" max="'+TODAY()+'"></div>'+
    '<div class="line"><span>Reminder chime</span><div class="seg" style="width:130px"><button class="'+(c.sound?'on':'')+'" data-a="sound" data-v="1">On</button><button class="'+(c.sound?'':'on')+'" data-a="sound" data-v="0">Off</button></div></div></div>'+
-   '<p>'+(sync==='synced'?'Saved privately to your Claude account. Open Year One on any device and it’s all there.':sync==='error'?'Saved on this device. Syncing to your account will retry shortly.':'Saved on this device only.')+'</p>'+
+   ghBlock()+
    '<div class="rowbtns"><button class="big ink" data-a="close">Done</button></div>'+
    (s_reset?'<div class="rowbtns"><button class="big soft" data-a="resetNo">Keep my data</button><button class="big soft danger" data-a="resetYes">Erase everything</button></div>':'<button class="danger" style="align-self:center;min-height:44px;font-weight:600" data-a="reset">Start the year over</button>')}
 let s_reset=false,wv=70;
@@ -624,7 +657,7 @@ const A={
  resetNo(){s_reset=false;drawSheet()},
  resetYes(){const ids=allIds();S={cfg:defCfg(),weights:{w:{},t:Date.now()},months:{}};S.cfg.t=Date.now();saveLocal();
    if(col){ids.forEach(id=>{if(id.indexOf('m-')===0)col.doc(id).delete().catch(()=>{})});dirty.add('config');dirty.add('weights');flush()}
-   s_reset=false;ui.date=TODAY();closeSheet();toast('Fresh start. Day one.')},
+   if(gh)ghPush(true);s_reset=false;ui.date=TODAY();closeSheet();toast('Fresh start. Day one.')},
  weigh(v){const cur=S.weights.w[v],prev=wBefore(addD(v,1));wv=cur!=null?cur:prev!=null?prev:70;openSheet('weigh',v)},
  wstep(v){const i=$('#wv');wv=Math.round(((parseFloat(i.value)||wv)+ +v)*10)/10;i.value=wv.toFixed(1)},
  wsave(v){const x=parseFloat($('#wv').value);if(!(x>20&&x<400)){toast('Enter a weight in kilograms');return}S.weights.w[v]=Math.round(x*10)/10;touch('weights');closeSheet();toast('Weight logged')},
@@ -649,6 +682,17 @@ const A={
  hSave(){readH();if(!hdraft.name){toast('Give the habit a name');return}if(!hdraft.days.length){toast('Pick at least one day');return}hdraft.id=Date.now().toString(36);S.cfg.habits.push(hdraft);hdraft=null;touch('config');closeSheet();toast('Habit added')},
  hDel(){const id=ui.sheet.arg.slice(2);S.cfg.habits=S.cfg.habits.filter(x=>x.id!==id);touch('config');closeSheet();toast('Habit deleted')},
  hab(v){mutDay(ui.date,o=>{o.h=o.h||{};if(o.h[v])delete o.h[v];else o.h[v]=1});render()},
+ async ghOn(){const repo=$('#gh-repo').value.trim().replace(/^https?:\/\/github\.com\//,'').replace(/(\.git)?\/?$/,''),token=$('#gh-token').value.trim();
+   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){toast('Repo should look like username/repo');return}if(!token){toast('Paste the access token');return}
+   gh={repo:repo,token:token};toast('Connecting…');
+   try{const r=await ghReq('');if(r.status===401)throw{m:'GitHub didn’t accept that token'};if(!r.ok)throw{m:'That token can’t see '+repo};
+     if((await r.json()).private===false)throw{m:'That repo is public. Use a private one.'};
+     const m=await ghPull();try{localStorage.setItem(GHK,JSON.stringify(gh))}catch(x){}
+     if(m.ahead){await ghPush();if(ghState==='error')throw{m:'The token can’t write. Set Contents to Read and write.'}}else{ghState='ok';ghLast=Date.now()}
+     toast('Connected. Your log is backed up.');if(ui.sheet)closeSheet();else render()}
+   catch(e){gh=null;try{localStorage.removeItem(GHK)}catch(x){}ghState='off';toast(e.m||((e.status===403||e.status===404)?'The token can’t read that repo’s contents':'Couldn’t reach GitHub. Try again.'));if(ui.sheet)drawSheet()}},
+ ghOff(){gh=null;ghState='off';clearTimeout(ghT);try{localStorage.removeItem(GHK)}catch(x){}drawSheet()},
+ ghNow(){ghSync().then(()=>{if(ui.sheet&&ui.sheet.kind==='settings')drawSheet()});drawSheet()},
  banX(){$('#banHost').innerHTML=''}
 };
 function readDraft(){if(!draft)return;const a=$('#rem-title'),b=$('#rem-time');if(a)draft.title=a.value.trim();if(b&&b.value)draft.time=b.value}
@@ -689,7 +733,7 @@ function tick(){const t=TODAY(),key=t+'|'+isNight();
   const nl=$('#nowl');if(nl)nl.style.top=Math.round((nowMin()-F0)*PX)+'px';
   checkReminders()}
 
-saveLocal();render();lastKey=TODAY()+'|'+isNight();checkReminders();setInterval(tick,20000);initSync();
+saveLocal();render();lastKey=TODAY()+'|'+isNight();checkReminders();setInterval(tick,20000);initSync();if(gh)ghSync();
 })();
 </script>
 
